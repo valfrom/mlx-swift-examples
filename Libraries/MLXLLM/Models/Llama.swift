@@ -340,6 +340,226 @@ public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 }
 
+public struct LlamaModelForwardOutput: Sendable {
+    public let lastHiddenState: MLXArray
+    public let pastKeyValues: [KVCache]?
+    public let hiddenStates: [MLXArray]?
+    public let attentions: [MLXArray]?
+
+    public init(
+        lastHiddenState: MLXArray,
+        pastKeyValues: [KVCache]?,
+        hiddenStates: [MLXArray]?,
+        attentions: [MLXArray]?
+    ) {
+        self.lastHiddenState = lastHiddenState
+        self.pastKeyValues = pastKeyValues
+        self.hiddenStates = hiddenStates
+        self.attentions = attentions
+    }
+}
+
+/// Transformers-aligned Llama model implementation focused on inference.
+///
+/// Mirrors the high level structure from HuggingFace's ``LlamaModel`` but uses
+/// Swift MLX layers and removes training-specific behaviour such as gradient
+/// checkpointing.
+public final class TransformersLlamaModel: Module {
+
+    public let config: LlamaConfiguration
+
+    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
+
+    fileprivate let layers: [TransformerBlock]
+    let norm: RMSNorm
+
+    public init(_ config: LlamaConfiguration) {
+        precondition(config.vocabularySize > 0)
+        self.config = config
+        self._embedTokens.wrappedValue = Embedding(
+            embeddingCount: config.vocabularySize, dimensions: config.hiddenSize)
+        self.layers = (0 ..< config.hiddenLayers).map { _ in TransformerBlock(config) }
+        self.norm = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+    }
+
+    public func getInputEmbeddings() -> Embedding { embedTokens }
+
+    public func setInputEmbeddings(_ value: Embedding) {
+        self._embedTokens.wrappedValue = value
+    }
+
+    public func forward(
+        inputIds: MLXArray? = nil,
+        attentionMask: MLXArray? = nil,
+        positionIds: MLXArray? = nil,
+        pastKeyValues: [KVCache]? = nil,
+        inputsEmbeds: MLXArray? = nil,
+        useCache: Bool? = nil,
+        outputAttentions: Bool? = nil,
+        outputHiddenStates: Bool? = nil,
+        returnDict: Bool? = nil,
+        cachePosition: MLXArray? = nil
+    ) -> LlamaModelForwardOutput {
+        precondition(
+            (inputIds != nil) != (inputsEmbeds != nil),
+            "You must specify exactly one of inputIds or inputsEmbeds")
+
+        if let returnDict, !returnDict {
+            fatalError("Tuple outputs are not supported in TransformersLlamaModel")
+        }
+
+        if outputAttentions ?? false {
+            fatalError("outputAttentions is not supported in TransformersLlamaModel")
+        }
+
+        let useCache = useCache ?? (config.hiddenLayers > 0)
+        let collectHiddenStates = outputHiddenStates ?? false
+
+        var hiddenStates: MLXArray
+        if let inputsEmbeds {
+            hiddenStates = inputsEmbeds
+        } else if let inputIds {
+            hiddenStates = embedTokens(inputIds)
+        } else {
+            fatalError("Invalid inputs for TransformersLlamaModel")
+        }
+
+        var cache = useCache ? pastKeyValues : nil
+        if useCache && cache == nil {
+            cache = (0 ..< layers.count).map { _ in KVCacheSimple() }
+        }
+
+        let (maskMode, cachePositionResolved, positionIdsResolved) = prepareMaskAndPositions(
+            attentionMask: attentionMask,
+            hiddenStates: hiddenStates,
+            cache: cache,
+            cachePosition: cachePosition,
+            positionIds: positionIds
+        )
+
+        var allHiddenStates: [MLXArray] = []
+        if collectHiddenStates {
+            allHiddenStates.reserveCapacity(layers.count + 1)
+        }
+
+        for (idx, layer) in layers.enumerated() {
+            if collectHiddenStates {
+                allHiddenStates.append(hiddenStates)
+            }
+
+            hiddenStates = layer(hiddenStates, mask: maskMode, cache: cache?[idx])
+        }
+
+        hiddenStates = norm(hiddenStates)
+
+        if collectHiddenStates {
+            allHiddenStates.append(hiddenStates)
+        }
+
+        let nextCache = useCache ? cache : nil
+
+        _ = cachePositionResolved
+        _ = positionIdsResolved
+
+        return LlamaModelForwardOutput(
+            lastHiddenState: hiddenStates,
+            pastKeyValues: nextCache,
+            hiddenStates: collectHiddenStates ? allHiddenStates : nil,
+            attentions: nil
+        )
+    }
+
+    private func prepareMaskAndPositions(
+        attentionMask: MLXArray?,
+        hiddenStates: MLXArray,
+        cache: [KVCache]?,
+        cachePosition: MLXArray?,
+        positionIds: MLXArray?
+    ) -> (MLXFast.ScaledDotProductAttentionMaskMode, MLXArray, MLXArray) {
+        let sequenceLength = hiddenStates.dim(1)
+        let batchSize = hiddenStates.dim(0)
+
+        let pastSeenTokens = cache?.first?.offset ?? 0
+        let resolvedCachePosition: MLXArray
+        if let cachePosition {
+            resolvedCachePosition = cachePosition
+        } else {
+            resolvedCachePosition = MLXArray(
+                Int32(pastSeenTokens) ..< Int32(pastSeenTokens + sequenceLength))
+        }
+
+        let resolvedPositionIds: MLXArray
+        if let positionIds {
+            resolvedPositionIds = positionIds
+        } else {
+            resolvedPositionIds = resolvedCachePosition[.newAxis, 0...]
+        }
+
+        let mask = buildAttentionMask(
+            attentionMask: attentionMask,
+            sequenceLength: sequenceLength,
+            batchSize: batchSize,
+            cachePosition: resolvedCachePosition,
+            hiddenStates: hiddenStates,
+            cache: cache
+        )
+
+        return (mask, resolvedCachePosition, resolvedPositionIds)
+    }
+
+    private func buildAttentionMask(
+        attentionMask: MLXArray?,
+        sequenceLength: Int,
+        batchSize: Int,
+        cachePosition: MLXArray,
+        hiddenStates: MLXArray,
+        cache: [KVCache]?
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if sequenceLength <= 1 && attentionMask == nil {
+            return .none
+        }
+
+        if attentionMask == nil,
+            cache?.first?.maxSize == nil,
+            sequenceLength > 1
+        {
+            return .causal
+        }
+
+        let dtype = hiddenStates.dtype
+        let pastSeenTokens = cache?.first?.offset ?? 0
+        let targetLength: Int
+        if let maxSize = cache?.first?.maxSize {
+            targetLength = maxSize
+        } else if let attentionMask {
+            targetLength = attentionMask.dim(attentionMask.ndim - 1)
+        } else {
+            targetLength = pastSeenTokens + sequenceLength
+        }
+
+        let negLarge = MLXArray(-Float(1e9), dtype: dtype)
+        let queryPositions = cachePosition.asType(.int32)[0..., .newAxis]
+        let keyPositions = MLXArray(Int32(0) ..< Int32(targetLength))[.newAxis, 0...]
+        var causalMask2D = (keyPositions .> queryPositions).asType(dtype) * negLarge
+        var mask = causalMask2D[.newAxis, .newAxis, 0..., 0...]
+
+        if let attentionMask {
+            let maskLength = attentionMask.dim(attentionMask.ndim - 1)
+            var paddingMask = MLXArray.zeros([attentionMask.dim(0), targetLength], dtype: dtype)
+            let ones = MLXArray.ones(attentionMask.shape, dtype: dtype)
+            let adjustment = (attentionMask.asType(dtype) - ones) * MLXArray(Float(1e9), dtype: dtype)
+            paddingMask[0..., ..<maskLength] = adjustment
+            mask = mask + paddingMask[0..., .newAxis, .newAxis, 0...]
+        }
+
+        if batchSize > 1 {
+            mask = mask + MLXArray.zeros([batchSize, 1, 1, 1], dtype: dtype)
+        }
+
+        return .array(mask)
+    }
+}
+
 public struct LlamaConfiguration: Codable, Sendable {
 
     var hiddenSize: Int
