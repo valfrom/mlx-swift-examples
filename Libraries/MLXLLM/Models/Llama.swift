@@ -370,7 +370,7 @@ public final class TransformersLlamaModel: Module {
 
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    let layers: [TransformerBlock]
+    fileprivate let layers: [TransformerBlock]
     let norm: RMSNorm
 
     public init(_ config: LlamaConfiguration) {
@@ -412,7 +412,7 @@ public final class TransformersLlamaModel: Module {
             fatalError("outputAttentions is not supported in TransformersLlamaModel")
         }
 
-        let useCache = useCache ?? config.hiddenLayers > 0
+        let useCache = useCache ?? (config.hiddenLayers > 0)
         let collectHiddenStates = outputHiddenStates ?? false
 
         var hiddenStates: MLXArray
