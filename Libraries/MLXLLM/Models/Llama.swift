@@ -176,7 +176,10 @@ private class Attention: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?,
+        positionEmbeddings: (cos: MLXArray, sin: MLXArray)? = nil
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
 
@@ -189,7 +192,18 @@ private class Attention: Module {
         keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
+        if let positionEmbeddings {
+            queries = applyRotary(
+                queries,
+                cos: positionEmbeddings.cos,
+                sin: positionEmbeddings.sin
+            )
+            keys = applyRotary(
+                keys,
+                cos: positionEmbeddings.cos,
+                sin: positionEmbeddings.sin
+            )
+        } else if let cache {
             queries = rope(queries, offset: cache.offset)
             keys = rope(keys, offset: cache.offset)
         } else {
@@ -209,6 +223,33 @@ private class Attention: Module {
         .reshaped(B, L, -1)
 
         return wo(output)
+    }
+
+    private func applyRotary(
+        _ tensor: MLXArray,
+        cos: MLXArray,
+        sin: MLXArray
+    ) -> MLXArray {
+        var cos = cos
+        var sin = sin
+        if cos.dtype != tensor.dtype {
+            cos = cos.asType(tensor.dtype)
+        }
+        if sin.dtype != tensor.dtype {
+            sin = sin.asType(tensor.dtype)
+        }
+
+        cos = cos[0..., .newAxis, 0..., 0...]
+        sin = sin[0..., .newAxis, 0..., 0...]
+
+        let lastDim = tensor.dim(tensor.ndim - 1)
+        let halfDim = lastDim / 2
+        let firstHalf = tensor[.ellipsis, ..<halfDim]
+        let secondHalf = tensor[.ellipsis, halfDim...]
+        let negSecondHalf = secondHalf * MLXArray(-1, dtype: tensor.dtype)
+        let rotated = MLX.concatenate([negSecondHalf, firstHalf], axis: -1)
+
+        return tensor * cos + rotated * sin
     }
 }
 
@@ -247,9 +288,17 @@ private class TransformerBlock: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?,
+        positionEmbeddings: (cos: MLXArray, sin: MLXArray)? = nil
     ) -> MLXArray {
-        var r = attention(inputLayerNorm(x), mask: mask, cache: cache)
+        var r = attention(
+            inputLayerNorm(x),
+            mask: mask,
+            cache: cache,
+            positionEmbeddings: positionEmbeddings
+        )
         let h = x + r
         r = mlp(postAttentionLayerNorm(h))
         let out = h + r
@@ -369,6 +418,7 @@ public final class TransformersLlamaModel: Module {
     public let config: LlamaConfiguration
 
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
+    @ModuleInfo(key: "rotary_emb") var rotaryEmbedding: TransformersRotaryEmbedding
 
     fileprivate let layers: [TransformerBlock]
     let norm: RMSNorm
@@ -378,6 +428,7 @@ public final class TransformersLlamaModel: Module {
         self.config = config
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabularySize, dimensions: config.hiddenSize)
+        self._rotaryEmbedding.wrappedValue = TransformersRotaryEmbedding(config: config)
         self.layers = (0 ..< config.hiddenLayers).map { _ in TransformerBlock(config) }
         self.norm = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
     }
@@ -429,7 +480,7 @@ public final class TransformersLlamaModel: Module {
             cache = (0 ..< layers.count).map { _ in KVCacheSimple() }
         }
 
-        let (maskMode, cachePositionResolved, positionIdsResolved) = prepareMaskAndPositions(
+        let (maskMode, _, positionIdsResolved) = prepareMaskAndPositions(
             attentionMask: attentionMask,
             hiddenStates: hiddenStates,
             cache: cache,
@@ -442,12 +493,22 @@ public final class TransformersLlamaModel: Module {
             allHiddenStates.reserveCapacity(layers.count + 1)
         }
 
+        let positionEmbeddings = rotaryEmbedding(
+            hiddenStates: hiddenStates,
+            positionIds: positionIdsResolved
+        )
+
         for (idx, layer) in layers.enumerated() {
             if collectHiddenStates {
                 allHiddenStates.append(hiddenStates)
             }
 
-            hiddenStates = layer(hiddenStates, mask: maskMode, cache: cache?[idx])
+            hiddenStates = layer(
+                hiddenStates,
+                mask: maskMode,
+                cache: cache?[idx],
+                positionEmbeddings: positionEmbeddings
+            )
         }
 
         hiddenStates = norm(hiddenStates)
@@ -458,15 +519,98 @@ public final class TransformersLlamaModel: Module {
 
         let nextCache = useCache ? cache : nil
 
-        _ = cachePositionResolved
-        _ = positionIdsResolved
-
         return LlamaModelForwardOutput(
             lastHiddenState: hiddenStates,
             pastKeyValues: nextCache,
             hiddenStates: collectHiddenStates ? allHiddenStates : nil,
             attentions: nil
         )
+    }
+
+    private final class TransformersRotaryEmbedding: Module {
+
+        let dims: Int
+        let base: Float
+        let ropeScaling: [String: StringOrNumber]?
+        let ropeType: String
+        let maxPositionEmbeddings: Int
+
+        @ModuleInfo(key: "inv_freq") var inverseFrequencies: MLXArray
+
+        init(config: LlamaConfiguration) {
+            self.dims = config.resolvedHeadDimensions
+            self.maxPositionEmbeddings = config.maxPositionEmbeddings ?? 2048
+            self.ropeScaling = config.ropeScaling
+            if let ropeScaling,
+                let rawType = ropeScaling["type"] ?? ropeScaling["rope_type"],
+                case .string(let resolvedType) = rawType
+            {
+                self.ropeType = resolvedType
+            } else {
+                self.ropeType = "default"
+            }
+
+            let resolvedBase = computeBaseFrequency(
+                base: config.ropeTheta,
+                dims: dims,
+                ropeType: ropeType,
+                ropeScaling: config.ropeScaling
+            )
+            self.base = resolvedBase
+
+            let exponent = MLXArray(stride(from: 0, to: dims, by: 2)).asType(.float32) / Float(dims)
+            let invFreq = MLXArray(1.0) / MLX.pow(MLXArray(resolvedBase), exponent)
+            self._inverseFrequencies.wrappedValue = invFreq
+        }
+
+        private func applyScalingIfNeeded(_ positionIds: MLXArray) -> MLXArray {
+            guard let ropeScaling,
+                case .string(let type) = ropeScaling["type"] ?? ropeScaling["rope_type"],
+                case .float(let factor) = ropeScaling["factor"]
+            else {
+                return positionIds
+            }
+
+            switch type {
+            case "linear", "dynamic":
+                return positionIds / MLXArray(factor)
+            default:
+                return positionIds
+            }
+        }
+
+        func callAsFunction(
+            hiddenStates: MLXArray,
+            positionIds: MLXArray
+        ) -> (cos: MLXArray, sin: MLXArray) {
+            var positionIds = positionIds
+            if positionIds.dtype != .float32 {
+                positionIds = positionIds.asType(.float32)
+            }
+            positionIds = applyScalingIfNeeded(positionIds)
+
+            var invFreq = inverseFrequencies
+            if invFreq.dtype != .float32 {
+                invFreq = invFreq.asType(.float32)
+            }
+
+            var freqs = positionIds[.ellipsis, .newAxis]
+            freqs = freqs * invFreq[.newAxis, .newAxis, 0...]
+            freqs = MLX.concatenate([freqs, freqs], axis: -1)
+
+            var cos = MLX.cos(freqs)
+            var sin = MLX.sin(freqs)
+
+            let targetType = hiddenStates.dtype
+            if cos.dtype != targetType {
+                cos = cos.asType(targetType)
+            }
+            if sin.dtype != targetType {
+                sin = sin.asType(targetType)
+            }
+
+            return (cos, sin)
+        }
     }
 
     private func prepareMaskAndPositions(
