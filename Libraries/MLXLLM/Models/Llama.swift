@@ -291,8 +291,17 @@ private class TransformerBlock: Module {
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
+        positionIds: MLXArray? = nil,
+        outputAttentions: Bool = false,
+        useCache: Bool = true,
+        cachePosition: MLXArray? = nil,
         positionEmbeddings: (cos: MLXArray, sin: MLXArray)? = nil
     ) -> MLXArray {
+        precondition(!outputAttentions, "outputAttentions is not supported")
+        _ = positionIds
+        _ = useCache
+        _ = cachePosition
+
         var r = attention(
             inputLayerNorm(x),
             mask: mask,
@@ -480,7 +489,7 @@ public final class TransformersLlamaModel: Module {
             cache = (0 ..< layers.count).map { _ in KVCacheSimple() }
         }
 
-        let (maskMode, _, positionIdsResolved) = prepareMaskAndPositions(
+        let (maskMode, cachePositionResolved, positionIdsResolved) = prepareMaskAndPositions(
             attentionMask: attentionMask,
             hiddenStates: hiddenStates,
             cache: cache,
@@ -507,6 +516,10 @@ public final class TransformersLlamaModel: Module {
                 hiddenStates,
                 mask: maskMode,
                 cache: cache?[idx],
+                positionIds: positionIdsResolved,
+                outputAttentions: false,
+                useCache: useCache,
+                cachePosition: cachePositionResolved,
                 positionEmbeddings: positionEmbeddings
             )
         }
