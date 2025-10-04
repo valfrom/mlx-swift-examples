@@ -239,17 +239,30 @@ private class Attention: Module {
             sin = sin.asType(tensor.dtype)
         }
 
-        cos = cos[0..., .newAxis, 0..., 0...]
-        sin = sin[0..., .newAxis, 0..., 0...]
-
+        var cosExpanded = cos[0..., .newAxis, 0..., 0...]
+        var sinExpanded = sin[0..., .newAxis, 0..., 0...]
         let lastDim = tensor.dim(tensor.ndim - 1)
-        let halfDim = lastDim / 2
-        let firstHalf = tensor[.ellipsis, ..<halfDim]
-        let secondHalf = tensor[.ellipsis, halfDim...]
-        let negSecondHalf = secondHalf * MLXArray(-1, dtype: tensor.dtype)
-        let rotated = MLX.concatenate([negSecondHalf, firstHalf], axis: -1)
+        precondition(lastDim % 2 == 0, "Rotary embeddings require an even head dimension")
 
-        return tensor * cos + rotated * sin
+        let evenSelector: MLXArraySlice = .stride(by: 2)
+        let oddSelector: MLXArraySlice = .stride(from: 1, by: 2)
+
+        let cosEven = cosExpanded[.ellipsis, evenSelector]
+        let cosOdd = cosExpanded[.ellipsis, oddSelector]
+        let sinEven = sinExpanded[.ellipsis, evenSelector]
+        let sinOdd = sinExpanded[.ellipsis, oddSelector]
+
+        let even = tensor[.ellipsis, evenSelector]
+        let odd = tensor[.ellipsis, oddSelector]
+
+        let rotatedEven = even * cosEven - odd * sinEven
+        let rotatedOdd = odd * cosOdd + even * sinOdd
+
+        var output = tensor
+        output[.ellipsis, evenSelector] = rotatedEven
+        output[.ellipsis, oddSelector] = rotatedOdd
+
+        return output
     }
 }
 
