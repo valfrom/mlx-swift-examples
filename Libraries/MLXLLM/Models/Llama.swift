@@ -130,6 +130,33 @@ private class DynamicNTKScalingRoPE: Module {
             freqs: freqs
         )
     }
+
+    func positionEmbeddings(
+        sequenceLength: Int,
+        offset: Int,
+        dtype: MLXDataType
+    ) -> (cos: MLXArray, sin: MLXArray) {
+        if sequenceLength == 0 {
+            let empty = MLXArray.zeros([0, dims / 2], dtype: dtype)
+            return (empty, empty)
+        }
+
+        let halfDim = dims / 2
+        var base = concatenated([
+            MLXArray.ones([sequenceLength, halfDim], dtype: dtype),
+            MLXArray.zeros([sequenceLength, halfDim], dtype: dtype),
+        ], axis: -1)
+        base = base.reshaped(1, 1, sequenceLength, dims)
+
+        var rotated = self(base, offset: offset)
+        rotated = rotated.squeezed(axis: 0)
+        rotated = rotated.squeezed(axis: 0)
+
+        let cos = rotated[0..., 0 ..< halfDim]
+        let sin = rotated[0..., halfDim...]
+
+        return (cos, sin)
+    }
 }
 
 private class Attention: Module {
@@ -176,7 +203,10 @@ private class Attention: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?,
+        positionEmbeddings: (cos: MLXArray, sin: MLXArray)? = nil
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
 
@@ -190,11 +220,23 @@ private class Attention: Module {
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
         if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
+            queries = applyRoPE(
+                queries,
+                offset: cache.offset,
+                positionEmbeddings: positionEmbeddings)
+            keys = applyRoPE(
+                keys,
+                offset: cache.offset,
+                positionEmbeddings: positionEmbeddings)
         } else {
-            queries = rope(queries)
-            keys = rope(keys)
+            queries = applyRoPE(
+                queries,
+                offset: nil,
+                positionEmbeddings: positionEmbeddings)
+            keys = applyRoPE(
+                keys,
+                offset: nil,
+                positionEmbeddings: positionEmbeddings)
         }
 
         let output = attentionWithCacheUpdate(
@@ -209,6 +251,48 @@ private class Attention: Module {
         .reshaped(B, L, -1)
 
         return wo(output)
+    }
+
+    private func applyRoPE(
+        _ x: MLXArray,
+        offset: Int?,
+        positionEmbeddings: (cos: MLXArray, sin: MLXArray)?
+    ) -> MLXArray {
+        if let positionEmbeddings {
+            return applyRoPE(x, cos: positionEmbeddings.cos, sin: positionEmbeddings.sin)
+        }
+
+        return rope(x, offset: offset ?? 0)
+    }
+
+    private func applyRoPE(_ x: MLXArray, cos: MLXArray, sin: MLXArray) -> MLXArray {
+        let seqLength = x.dim(2)
+
+        var cosHalf = cos
+        var sinHalf = sin
+
+        if cosHalf.dim(0) != seqLength {
+            cosHalf = cosHalf[0 ..< seqLength, 0...]
+            sinHalf = sinHalf[0 ..< seqLength, 0...]
+        }
+
+        var cosExpanded = MLX.expandedDimensions(cosHalf, axes: [0, 1])
+        var sinExpanded = MLX.expandedDimensions(sinHalf, axes: [0, 1])
+
+        cosExpanded = tiled(cosExpanded, repetitions: [1, 1, 1, 2])
+        sinExpanded = tiled(sinExpanded, repetitions: [1, 1, 1, 2])
+
+        cosExpanded = cosExpanded.asType(x.dtype)
+        sinExpanded = sinExpanded.asType(x.dtype)
+
+        return (x * cosExpanded) + (rotateHalf(x) * sinExpanded)
+    }
+
+    private func rotateHalf(_ x: MLXArray) -> MLXArray {
+        let index = x.dim(-1) / 2
+        let x1 = x[.ellipsis, 0 ..< index]
+        let x2 = x[.ellipsis, index...]
+        return concatenated([-x2, x1], axis: -1)
     }
 }
 
@@ -247,9 +331,16 @@ private class TransformerBlock: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?,
+        positionEmbeddings: (cos: MLXArray, sin: MLXArray)? = nil
     ) -> MLXArray {
-        var r = attention(inputLayerNorm(x), mask: mask, cache: cache)
+        var r = attention(
+            inputLayerNorm(x),
+            mask: mask,
+            cache: cache,
+            positionEmbeddings: positionEmbeddings)
         let h = x + r
         r = mlp(postAttentionLayerNorm(h))
         let out = h + r
@@ -325,6 +416,124 @@ public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
     public func messageGenerator(tokenizer: any Tokenizer) -> any MessageGenerator {
         // some models allow the system role and some do not -- this is enforced
         // by the chat template (code).
+        do {
+            let probe = [
+                [
+                    "role": "system",
+                    "content": "test",
+                ]
+            ]
+            _ = try tokenizer.applyChatTemplate(messages: probe)
+            return DefaultMessageGenerator()
+        } catch {
+            return NoSystemMessageGenerator()
+        }
+    }
+}
+
+private class TransformersLlamaModelInner: Module {
+
+    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
+
+    let layers: [TransformerBlock]
+    let norm: RMSNorm
+    let rotaryEmbedding: DynamicNTKScalingRoPE
+
+    init(_ args: LlamaConfiguration) {
+        precondition(args.vocabularySize > 0)
+
+        self._embedTokens.wrappedValue = Embedding(
+            embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
+
+        self.layers = (0 ..< args.hiddenLayers).map { _ in TransformerBlock(args) }
+        self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        self.rotaryEmbedding = DynamicNTKScalingRoPE(
+            dims: args.resolvedHeadDimensions,
+            maxPositionEmbeddings: args.maxPositionEmbeddings,
+            traditional: args.ropeTraditional,
+            base: args.ropeTheta,
+            scale: 1.0,
+            ropeType: {
+                if case .string(let value) = args.ropeScaling?["type"] {
+                    return value
+                } else {
+                    return "default"
+                }
+            }(),
+            ropeScaling: args.ropeScaling)
+    }
+
+    func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]? = nil,
+        cachePosition: Int? = nil
+    ) -> MLXArray {
+        var h = embedTokens(inputs)
+
+        let mask = createAttentionMask(h: h, cache: cache)
+
+        let offset = cachePosition ?? cache?.first?.offset ?? 0
+        let sequenceLength = h.dim(1)
+        let positionEmbeddings = rotaryEmbedding.positionEmbeddings(
+            sequenceLength: sequenceLength,
+            offset: offset,
+            dtype: h.dtype)
+
+        for (i, layer) in layers.enumerated() {
+            h = layer(
+                h,
+                mask: mask,
+                cache: cache?[i],
+                positionEmbeddings: positionEmbeddings)
+        }
+
+        return norm(h)
+    }
+}
+
+/// Model variant mirroring the Transformers implementation with shared rotary embeddings.
+public class TransformersLlamaModel: Module, LLMModel, KVCacheDimensionProvider {
+
+    public let vocabularySize: Int
+    public let kvHeads: [Int]
+
+    fileprivate let model: TransformersLlamaModelInner
+
+    @ModuleInfo(key: "lm_head") var lmHead: Linear?
+
+    public init(_ args: LlamaConfiguration) {
+        self.vocabularySize = args.vocabularySize
+        self.kvHeads = (0 ..< args.hiddenLayers).map { _ in args.kvHeads }
+        self.model = TransformersLlamaModelInner(args)
+        if !args.tieWordEmbeddings {
+            self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
+        }
+    }
+
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        callAsFunction(inputs, cache: cache, cachePosition: nil)
+    }
+
+    public func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        cachePosition: Int?
+    ) -> MLXArray {
+        let out = model(inputs, cache: cache, cachePosition: cachePosition)
+        if let lmHead {
+            return lmHead(out)
+        } else {
+            return model.embedTokens.asLinear(out)
+        }
+    }
+
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        weights.filter {
+            !$0.key.contains("self_attn.rotary_emb.inv_freq")
+        }
+    }
+
+    public func messageGenerator(tokenizer: any Tokenizer) -> any MessageGenerator {
         do {
             let probe = [
                 [
@@ -470,6 +679,12 @@ public struct LlamaConfiguration: Codable, Sendable {
 // MARK: - LoRA
 
 extension LlamaModel: LoRAModel {
+    public func loraLinearLayers() -> LoRALinearLayers {
+        model.layers.map { ($0.attention, ["q_proj", "v_proj"]) }
+    }
+}
+
+extension TransformersLlamaModel: LoRAModel {
     public func loraLinearLayers() -> LoRALinearLayers {
         model.layers.map { ($0.attention, ["q_proj", "v_proj"]) }
     }
