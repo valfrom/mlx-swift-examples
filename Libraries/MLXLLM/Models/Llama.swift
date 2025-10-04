@@ -239,30 +239,27 @@ private class Attention: Module {
             sin = sin.asType(tensor.dtype)
         }
 
-        var cosExpanded = cos[0..., .newAxis, 0..., 0...]
-        var sinExpanded = sin[0..., .newAxis, 0..., 0...]
+        let cosExpanded = cos[0..., .newAxis, 0..., 0...]
+        let sinExpanded = sin[0..., .newAxis, 0..., 0...]
+
+        return tensor * cosExpanded + rotateHalf(tensor) * sinExpanded
+    }
+
+    private func rotateHalf(_ tensor: MLXArray) -> MLXArray {
         let lastDim = tensor.dim(tensor.ndim - 1)
         precondition(lastDim % 2 == 0, "Rotary embeddings require an even head dimension")
 
         let evenSelector: MLXArraySlice = .stride(by: 2)
         let oddSelector: MLXArraySlice = .stride(from: 1, by: 2)
 
-        let cosEven = cosExpanded[.ellipsis, evenSelector]
-        let cosOdd = cosExpanded[.ellipsis, oddSelector]
-        let sinEven = sinExpanded[.ellipsis, evenSelector]
-        let sinOdd = sinExpanded[.ellipsis, oddSelector]
-
         let even = tensor[.ellipsis, evenSelector]
         let odd = tensor[.ellipsis, oddSelector]
 
-        let rotatedEven = even * cosEven - odd * sinEven
-        let rotatedOdd = odd * cosOdd + even * sinOdd
+        var rotated = tensor
+        rotated[.ellipsis, evenSelector] = -odd
+        rotated[.ellipsis, oddSelector] = even
 
-        var output = tensor
-        output[.ellipsis, evenSelector] = rotatedEven
-        output[.ellipsis, oddSelector] = rotatedOdd
-
-        return output
+        return rotated
     }
 }
 
@@ -622,10 +619,21 @@ public final class TransformersLlamaModel: Module {
 
             var freqs = positionIds[.ellipsis, .newAxis]
             freqs = freqs * invFreq[.newAxis, .newAxis, 0...]
-            freqs = MLX.concatenate([freqs, freqs], axis: -1)
 
             var cos = MLX.cos(freqs)
             var sin = MLX.sin(freqs)
+
+            cos = MLX.stack([cos, cos], axis: -1)
+            sin = MLX.stack([sin, sin], axis: -1)
+
+            let cosShape = cos.shape
+            let sinShape = sin.shape
+            let cosLastTwo = cosShape[(cosShape.count - 2)...]
+            let sinLastTwo = sinShape[(sinShape.count - 2)...]
+            let cosFlattenedLast = cosLastTwo.first! * cosLastTwo.last!
+            let sinFlattenedLast = sinLastTwo.first! * sinLastTwo.last!
+            cos = cos.reshaped(Array(cosShape.dropLast(2)) + [cosFlattenedLast])
+            sin = sin.reshaped(Array(sinShape.dropLast(2)) + [sinFlattenedLast])
 
             let targetType = hiddenStates.dtype
             if cos.dtype != targetType {
