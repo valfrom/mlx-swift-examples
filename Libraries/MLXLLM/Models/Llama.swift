@@ -119,6 +119,33 @@ private class DynamicNTKScalingRoPE: Module {
         self.base = nil
     }
 
+    private func ropeFrequencies(dtype: MLXDType) -> MLXArray {
+        if let freqs {
+            return freqs.asType(dtype)
+        }
+
+        guard let base else {
+            fatalError("RoPE base frequency unavailable")
+        }
+
+        let exponent = MLXArray(stride(from: 0, to: dims, by: 2)).asType(dtype) / Float(dims)
+        return MLX.pow(MLXArray(base, dtype: dtype), exponent)
+    }
+
+    private func applyRotary(_ x: MLXArray, angles: MLXArray) -> MLXArray {
+        let reshaped = x.reshaped(x.shape.dropLast() + [dims / 2, 2])
+        let even = reshaped[.ellipsis, 0..., 0]
+        let odd = reshaped[.ellipsis, 0..., 1]
+
+        let cosAngles = MLX.cos(angles)
+        let sinAngles = MLX.sin(angles)
+
+        let rotatedEven = even * cosAngles - odd * sinAngles
+        let rotatedOdd = even * sinAngles + odd * cosAngles
+
+        return stacked([rotatedEven, rotatedOdd], axis: -1).reshaped(x.shape)
+    }
+
     func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
         MLXFast.RoPE(
             x,
@@ -129,6 +156,27 @@ private class DynamicNTKScalingRoPE: Module {
             offset: offset,
             freqs: freqs
         )
+    }
+
+    func callAsFunction(_ x: MLXArray, positions: MLXArray) -> MLXArray {
+        let dtype = x.dtype
+        var positions = positions.asType(dtype)
+
+        if positions.ndim == 1 {
+            positions = positions[.newAxis, 0...]
+        }
+
+        precondition(positions.ndim == 2, "positions must have shape [B, L]")
+        precondition(positions.dim(1) == x.dim(2), "Position length must match sequence length")
+
+        if positions.dim(0) != x.dim(0) {
+            positions = broadcast(positions, to: [x.dim(0), positions.dim(1)])
+        }
+
+        let freqs = ropeFrequencies(dtype: dtype)
+        let angles = positions[0..., .newAxis, 0..., .newAxis] / freqs[.newAxis, .newAxis, .newAxis, 0...]
+
+        return applyRotary(x, angles: angles)
     }
 }
 
@@ -176,7 +224,11 @@ private class Attention: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?,
+        cachePosition: MLXArray? = nil,
+        positionIds: MLXArray? = nil
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
 
@@ -189,7 +241,19 @@ private class Attention: Module {
         keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
+        let ropePositions: MLXArray?
+        if let positionIds {
+            ropePositions = positionIds
+        } else if let cachePosition {
+            ropePositions = cachePosition
+        } else {
+            ropePositions = nil
+        }
+
+        if let ropePositions {
+            queries = rope(queries, positions: ropePositions)
+            keys = rope(keys, positions: ropePositions)
+        } else if let cache {
             queries = rope(queries, offset: cache.offset)
             keys = rope(keys, offset: cache.offset)
         } else {
@@ -247,9 +311,19 @@ private class TransformerBlock: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?,
+        cachePosition: MLXArray? = nil,
+        positionIds: MLXArray? = nil
     ) -> MLXArray {
-        var r = attention(inputLayerNorm(x), mask: mask, cache: cache)
+        var r = attention(
+            inputLayerNorm(x),
+            mask: mask,
+            cache: cache,
+            cachePosition: cachePosition,
+            positionIds: positionIds
+        )
         let h = x + r
         r = mlp(postAttentionLayerNorm(h))
         let out = h + r
@@ -280,7 +354,13 @@ private class LlamaModelInner: Module {
         let mask = createAttentionMask(h: h, cache: cache)
 
         for (i, layer) in layers.enumerated() {
-            h = layer(h, mask: mask, cache: cache?[i])
+            h = layer(
+                h,
+                mask: mask,
+                cache: cache?[i],
+                cachePosition: nil,
+                positionIds: nil
+            )
         }
 
         return norm(h)
@@ -447,7 +527,13 @@ public final class TransformersLlamaModel: Module {
                 allHiddenStates.append(hiddenStates)
             }
 
-            hiddenStates = layer(hiddenStates, mask: maskMode, cache: cache?[idx])
+            hiddenStates = layer(
+                hiddenStates,
+                mask: maskMode,
+                cache: cache?[idx],
+                cachePosition: cachePositionResolved,
+                positionIds: positionIdsResolved
+            )
         }
 
         hiddenStates = norm(hiddenStates)
@@ -457,9 +543,6 @@ public final class TransformersLlamaModel: Module {
         }
 
         let nextCache = useCache ? cache : nil
-
-        _ = cachePositionResolved
-        _ = positionIdsResolved
 
         return LlamaModelForwardOutput(
             lastHiddenState: hiddenStates,
