@@ -177,7 +177,7 @@ private class Attention: Module {
 
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
-    ) -> MLXArray {
+    ) -> (MLXArray, KVCache?) {
         let (B, L) = (x.dim(0), x.dim(1))
 
         var queries = wq(x)
@@ -208,7 +208,7 @@ private class Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return wo(output)
+        return (wo(output), cache)
     }
 }
 
@@ -248,12 +248,14 @@ private class TransformerBlock: Module {
 
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
-    ) -> MLXArray {
-        var r = attention(inputLayerNorm(x), mask: mask, cache: cache)
+    ) -> (MLXArray, KVCache?) {
+        let (attentionOutput, updatedCache) = attention(
+            inputLayerNorm(x), mask: mask, cache: cache)
+        var r = attentionOutput
         let h = x + r
         r = mlp(postAttentionLayerNorm(h))
         let out = h + r
-        return out
+        return (out, updatedCache)
     }
 }
 
@@ -280,7 +282,8 @@ private class LlamaModelInner: Module {
         let mask = createAttentionMask(h: h, cache: cache)
 
         for (i, layer) in layers.enumerated() {
-            h = layer(h, mask: mask, cache: cache?[i])
+            let (nextHiddenState, _) = layer(h, mask: mask, cache: cache?[i])
+            h = nextHiddenState
         }
 
         return norm(h)
@@ -442,12 +445,27 @@ public final class TransformersLlamaModel: Module {
             allHiddenStates.reserveCapacity(layers.count + 1)
         }
 
+        var returnedCaches: [KVCache] = []
+        if useCache {
+            returnedCaches.reserveCapacity(layers.count)
+        }
+
         for (idx, layer) in layers.enumerated() {
             if collectHiddenStates {
                 allHiddenStates.append(hiddenStates)
             }
 
-            hiddenStates = layer(hiddenStates, mask: maskMode, cache: cache?[idx])
+            let (nextHiddenState, layerCache) = layer(
+                hiddenStates, mask: maskMode, cache: cache?[idx])
+            hiddenStates = nextHiddenState
+
+            if useCache {
+                if let layerCache {
+                    returnedCaches.append(layerCache)
+                } else if let existingCache = cache?[idx] {
+                    returnedCaches.append(existingCache)
+                }
+            }
         }
 
         hiddenStates = norm(hiddenStates)
@@ -456,7 +474,7 @@ public final class TransformersLlamaModel: Module {
             allHiddenStates.append(hiddenStates)
         }
 
-        let nextCache = useCache ? cache : nil
+        let nextCache: [KVCache]? = useCache ? returnedCaches : nil
 
         _ = cachePositionResolved
         _ = positionIdsResolved
